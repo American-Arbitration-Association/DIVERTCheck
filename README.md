@@ -16,6 +16,7 @@ This README is the front door for the repository. It explains the application, i
 
 | I want to… | Go to |
 | --- | --- |
+|See the User Guide | [DIVERTCheck User Guide](DIVERTCheck_User_Guide.docx) 
 | See how the system fits together | [ARCHITECTURE.md](docs/ARCHITECTURE.md) — diagram, request and review paths, conventions |
 | See the main paths through the system | [Flow Diagram](docs/diagrams/app_flow.png) — intake, AI review, verification, prompts, accounts |
 | Set up the app | [SETUP.md](docs/SETUP.md) — prerequisites, Azure access, first run, troubleshooting |
