@@ -1,0 +1,118 @@
+/*Copyright © 2026 American Arbitration Association, Inc. All rights reserved*/
+/* SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0 */
+@reference "tailwindcss";
+
+.statusNotifications {
+  @apply p-4 pb-0 top-0 z-50 fixed rounded-lg;
+  background-color: #f0efee;
+  width: 388px;
+  right: 30px;
+  top: 10px;
+  transition: top 0.3s ease-in-out;
+  z-index: 51;
+}
+
+.statusItem {
+  @apply flex flex-col gap-3 p-3 rounded-md border mb-3;
+  border-color: #d4d4d4;
+  background-color: #ffffff;
+}
+
+.statusWrapper {
+  @apply flex gap-3 flex-col mt-3;
+  display: flex;
+}
+
+.toast {
+  @apply flex items-start gap-3 rounded-lg border px-4 py-2 shadow-lg;
+  width: min(520px, calc(100vw - 32px));
+  border-color: #c1bab8;
+}
+
+.toast--compact {
+  width: fit-content;
+  min-width: min(300px, calc(100vw - 32px));
+  max-width: min(520px, calc(100vw - 32px));
+}
+
+.toast--success {
+  background-color: #f0fdf5;
+  border-color: #b7e4c7;
+}
+
+.toast--error {
+  background-color: #fef2f2;
+  border-color: #f5c2c7;
+}
+
+.toast--info {
+  background-color: #f7f6f5;
+  border-color: #c1bab8;
+}
+
+.toast__icon {
+  @apply flex h-6 w-6 shrink-0 items-center justify-center rounded-full;
+}
+
+.toast__icon--success {
+  color: #15803d;
+}
+
+.toast__icon--error {
+  color: #b42318;
+}
+
+.toast__icon--info {
+  color: #4a4442;
+}
+
+.toast__content {
+  @apply flex min-w-0 flex-1 flex-col justify-center gap-0.5 py-0.5;
+}
+
+.title {
+  @apply text-sm font-semibold leading-5;
+  color: #272423;
+  white-space: normal;
+}
+
+.description {
+  @apply text-sm font-normal leading-5;
+  color: #4a4442;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.toast__close {
+  @apply ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-md border-0 bg-transparent p-0 text-[#4A4442];
+  align-self: start;
+}
+
+.toast__close:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.wrapper {
+  @apply border rounded-lg p-6 gap-4;
+  background-color: #f7f6f5;
+  border-color: #c1bab8;
+  display: flex;
+  flex-direction: column;
+}
+
+.dialogTitle {
+  @apply text-lg font-semibold;
+}
+
+.dialogContent {
+  @apply flex gap-4;
+}
+
+.dialogDisclaimer {
+  @apply text-sm font-medium flex flex-col gap-3;
+}
+
+.actionWrapper {
+  @apply flex gap-2;
+  justify-content: end;
+}

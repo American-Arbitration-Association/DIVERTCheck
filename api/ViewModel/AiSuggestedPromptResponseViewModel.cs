@@ -1,0 +1,13 @@
+//Copyright © 2026 American Arbitration Association, Inc. All rights reserved
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+namespace api.ViewModels;
+
+public sealed record AiSuggestedPromptResponseViewModel(
+    long PromptSuggestionResponseId,
+    long PromptConfigurationId,
+    string PromptType,
+    string AiStatus,
+    string? GeneratedPrompt,
+    string? RawResponse,
+    DateTime CreatedAt,
+    DateTime ModifiedAt);

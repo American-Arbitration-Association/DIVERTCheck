@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+@reference "../index.css";
+
+@tailwind utilities;
+
+@layer base {
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    @apply text-foreground-primary;
+  }
+
+  h1 {
+    @apply text-7xl/11 font-light tracking-tight-xl;
+  }
+
+  h4 {
+    @apply text-3xl/6 font-normal tracking-tight-s;
+  }
+
+  h5 {
+    @apply text-2xl/6 font-normal tracking-normal;
+  }
+
+  body {
+    @apply font-sans text-foreground-primary;
+  }
+
+  hgroup {
+    h1 {
+      @apply text-xl/5 font-normal tracking-normal;
+    }
+
+    h2 {
+      @apply text-lg/5 font-normal tracking-normal;
+    }
+  }
+
+  a {
+    color: var(--brand-blue, #4238d6);
+    text-overflow: ellipsis;
+    font-family: "Inter", sans-serif;
+    font-size: var(--typography-Text-base-Small-font-size, 14px);
+    font-style: normal;
+    font-weight: 500;
+    line-height: var(--typography-Text-base-Small-line-height, 20px);
+    text-decoration-line: underline;
+    text-decoration-style: solid;
+    text-decoration-skip-ink: none;
+    text-decoration-thickness: auto;
+    text-underline-offset: 21.5%;
+    text-underline-position: from-font;
+    cursor: pointer;
+  }
+
+  .text-s-regular {
+    font-family: "Inter", sans-serif;
+    @apply text-sm/3 font-normal tracking-normal;
+  }
+}
+
+.text-s-regular {
+  @apply font-sans text-sm/3 font-normal text-foreground-secondary;
+}
+
+.text-s-medium {
+  @extend .text-s-regular;
+  @apply font-medium;
+}
+
+.text-l-regular {
+  @apply font-sans text-lg/5 font-normal text-foreground-primary;
+}
+
+.font-inter {
+  font-family: "Inter", sans-serif;
+}
+
+.font-suisse {
+  font-family: "Suisse Intl", sans-serif;
+}
+
+.font-gestura {
+  font-family: "Gestura Text", serif;
+}
+
+:root {
+  --breakpoints-sm: #{$break-sm};
+  --breakpoints-md: #{$break-md};
+  --breakpoints-lg: #{$break-lg};
+  --breakpoints-xl: #{$break-xl};
+  --breakpoints-2xl: #{$break-2xl};
+}
+
+// Reset and base styles
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Change Autocomplete styles in Chrome*/
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus {
+  border: 1px solid #253341;
+  -webkit-text-fill-color: #272423;
+  -webkit-box-shadow: 0 0 0px 1000px #ffffff inset;
+  box-shadow: 0 0 0px 1000px #ffffff inset;
+  color: #272423;
+}
+
+/* Hide up/down arrows in number inputs across browsers */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield; // Standard property for compatibility
+}
+
+// Tiptap global styles
+.tiptap p {
+  margin: 0;
+  display: inline;
+}
+
+.tiptap p:not(:first-child) {
+  padding-left: 0.3rem;
+}
+
+.tiptap p.is-editor-empty:first-child::before {
+  color: #adb5bd;
+  content: attr(data-placeholder);
+  float: left;
+  height: 0;
+  pointer-events: none;
+}
+
+// react date picker styles
+.react-datepicker__header {
+  @apply bg-accent border-b-0;
+}
+
+.react-datepicker__day--selected {
+  @apply bg-foreground-primary *:bg-foreground-primary text-accent hover:bg-foreground-primary focus:bg-foreground-primary focus:text-accent;
+}
+
+.react-datepicker__day--today {
+  @apply bg-secondary;
+}
+
+.react-datepicker__triangle {
+  @apply hidden;
+}

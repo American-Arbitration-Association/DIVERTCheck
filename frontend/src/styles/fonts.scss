@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+@font-face {
+  font-family: "Gestura Text";
+  font-style: normal;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("/fonts/Gestura-Text-Roman-VF.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Gestura Text";
+  font-style: italic;
+  font-weight: 400 900;
+  font-display: swap;
+  src: url("/fonts/Gestura-Text-Italic-VF.woff2") format("woff2");
+}
+
+// Suisse Int'l font weights (their "Thin" and "Ultralight" appear to be swapped)
+$suisse-font-weights: (
+  100: "Ultralight",
+  200: "Thin",
+  300: "Light",
+  400: "Regular",
+  450: "Book",
+  500: "Medium",
+  600: "SemiBold",
+  700: "Bold",
+  900: "Black",
+);
+
+@each $weight, $name in $suisse-font-weights {
+  @font-face {
+    font-family: "Suisse Intl";
+    font-style: normal;
+    font-weight: $weight;
+    font-display: swap;
+    src: url("/fonts/SuisseIntl-#{$name}-WebS.woff2") format("woff2");
+  }
+
+  @font-face {
+    font-family: "Suisse Intl";
+    font-style: italic;
+    font-weight: $weight;
+    font-display: swap;
+    src: url("/fonts/SuisseIntl-#{$name}Italic-WebS.woff2") format("woff2");
+  }
+}
