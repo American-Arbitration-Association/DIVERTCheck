@@ -141,7 +141,7 @@ function normalizeUtcDateTime(dateValue?: string | null) {
   return `${normalizedValue}Z`;
 }
 
-function mapReviewedDocument(
+export function mapReviewedDocument(
   apiItem: ReviewedDocumentApiItem,
 ): ReviewedDocumentItem {
   return {

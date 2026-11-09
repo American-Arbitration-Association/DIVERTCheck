@@ -2,6 +2,24 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 import { apiClient } from "./apiClient";
 import { API_ENDPOINTS } from "./index";
+import {
+  mapReviewedDocument,
+  type ReviewedDocumentApiItem,
+  type ReviewedDocumentItem,
+} from "./reviewDetails";
+
+export interface PendingReviewApiItem {
+  aiResponseId: number;
+  aiStatus: string;
+  documents: ReviewedDocumentApiItem[];
+}
+
+// A newer rerun that has not completed yet; it holds the case's current documents.
+export interface PendingReviewItem {
+  aiResponseId: number;
+  aiStatus: string;
+  documents: ReviewedDocumentItem[];
+}
 
 export interface ReviewQueueApiItem {
   aiResponseId: number;
@@ -14,6 +32,7 @@ export interface ReviewQueueApiItem {
   summary: string | null;
   documentName?: string | null;
   documents?: ReviewQueueDocumentApiItem[] | null;
+  pendingReview?: PendingReviewApiItem | null;
 }
 
 export interface ReviewQueueDocumentApiItem {
@@ -42,6 +61,7 @@ export interface ReviewQueueItem {
   documentName: string;
   documentHref: string;
   documents: ReviewQueueDocumentItem[];
+  pendingReview: PendingReviewItem | null;
 }
 
 function mapAiStatusToReviewStatus(
@@ -111,6 +131,13 @@ function mapReviewQueueItem(apiItem: ReviewQueueApiItem): ReviewQueueItem {
     documentName: primaryDocument?.documentName ?? "",
     documentHref: primaryDocument?.documentHref ?? "#",
     documents,
+    pendingReview: apiItem.pendingReview
+      ? {
+          aiResponseId: apiItem.pendingReview.aiResponseId,
+          aiStatus: apiItem.pendingReview.aiStatus,
+          documents: apiItem.pendingReview.documents.map(mapReviewedDocument),
+        }
+      : null,
   };
 }
 

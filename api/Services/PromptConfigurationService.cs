@@ -569,7 +569,8 @@ public sealed class PromptConfigurationService : IPromptConfigurationService
         await _db.PromptConfigurations
             .Where(configuration =>
                 configuration.IsRecordActive &&
-                configuration.CurrentPrompt)
+                configuration.CurrentPrompt &&
+                configuration.Prompt.PromptType == EligibilityPromptType)
             .ExecuteUpdateAsync(setters => setters
                 .SetProperty(configuration => configuration.CurrentPrompt, false)
                 .SetProperty(configuration => configuration.ModifiedUser, _userAuditService.CurrentUserId),

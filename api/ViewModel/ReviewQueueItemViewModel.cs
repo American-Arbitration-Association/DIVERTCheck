@@ -13,4 +13,5 @@ public sealed record ReviewQueueItemViewModel(
     DateTime CreatedAt,
     string AiStatus,
     string? Summary,
-    IReadOnlyCollection<ReviewQueueDocumentViewModel> Documents);
+    IReadOnlyCollection<ReviewQueueDocumentViewModel> Documents,
+    PendingReviewViewModel? PendingReview);

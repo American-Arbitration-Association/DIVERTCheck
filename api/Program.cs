@@ -25,6 +25,8 @@ builder.Host.UseNLog();
 const long MaximumUploadSizeBytes = 500L * 1024 * 1024;
 builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxRequestBodySize = MaximumUploadSizeBytes);
+builder.Services.Configure<IISServerOptions>(options =>
+    options.MaxRequestBodySize = MaximumUploadSizeBytes);
 builder.Services.Configure<FormOptions>(options =>
     options.MultipartBodyLengthLimit = MaximumUploadSizeBytes);
 

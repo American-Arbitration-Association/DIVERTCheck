@@ -58,6 +58,9 @@ public sealed class OpenAiExecutionService : IAiExecutionService
     private const string MaxParallelEvidenceCallsKey = "DocumentProcessing:MaxParallelEvidenceCalls";
     private const string EvidenceRetryCountKey = "DocumentProcessing:EvidenceRetryCount";
     private const string EvidenceMaxOutputTokensKey = "DocumentProcessing:EvidenceMaxOutputTokens";
+    private const string TransactionChunkMaxCharactersKey = "DocumentProcessing:TransactionChunkMaxCharacters";
+    private const string TransactionMaxOutputTokensKey = "DocumentProcessing:TransactionMaxOutputTokens";
+    private const string LedgerReconciliationRetryCountKey = "DocumentProcessing:LedgerReconciliationRetryCount";
     private const string FileSearchMaxResultsKey = "DocumentProcessing:FileSearchMaxResults";
     private static readonly TimeSpan VectorStorePollInterval = TimeSpan.FromSeconds(2);
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -131,7 +134,7 @@ public sealed class OpenAiExecutionService : IAiExecutionService
                 .Where(document => document.IsTransactionEvidenceDocument)
                 .ToArray();
             var transactionLedger = transactionEvidenceDocuments.Length > 0
-                ? await ExtractPurchaseTransactionsAsync(
+                ? await ExtractStatementLedgerAsync(
                     settings,
                     promptConfiguration,
                     await GetTransactionExtractionInstructionsAsync(cancellationToken),
@@ -152,10 +155,7 @@ public sealed class OpenAiExecutionService : IAiExecutionService
                 extractedTextFiles.Add(new ExtractedTextFile(
                     "statement-ledger.txt",
                     "statement-ledger.txt",
-                    BuildTransactionLedgerText(
-                        transactionLedgerWithExtractedValues.Transactions,
-                        transactionLedgerWithExtractedValues.CalculatedSum,
-                        transactionLedgerWithExtractedValues.MonetaryValues),
+                    transactionLedgerWithExtractedValues.ToLedgerText(),
                     IsDerived: true));
             }
 
@@ -168,7 +168,7 @@ public sealed class OpenAiExecutionService : IAiExecutionService
             if (transactionLedgerWithExtractedValues is not null)
                 evidenceDigest = evidenceDigest with
                 {
-                    Text = $"{evidenceDigest.Text}\n\n{BuildTransactionLedgerText(transactionLedgerWithExtractedValues.Transactions, transactionLedgerWithExtractedValues.CalculatedSum, transactionLedgerWithExtractedValues.MonetaryValues)}"
+                    Text = $"{evidenceDigest.Text}\n\n{transactionLedgerWithExtractedValues.ToLedgerText()}"
                 };
 
             retryState.EvidenceDocuments = evidenceDocuments;
@@ -208,12 +208,7 @@ public sealed class OpenAiExecutionService : IAiExecutionService
 
             if (transactionLedgerForReview is { HasExtractedValues: true })
             {
-                fullResponse = $"{fullResponse.Trim()}\n\n---\n\n" + BuildTransactionMarkdown(
-                    evidenceDocumentsForReview,
-                    transactionLedgerForReview.Transactions,
-                    decimal.Parse(transactionLedgerForReview.CalculatedSum, CultureInfo.InvariantCulture),
-                    transactionLedgerForReview.MonetaryValues,
-                    JsonSerializer.Serialize(transactionLedgerForReview, TransactionJsonOptions));
+                fullResponse = $"{fullResponse.Trim()}\n\n---\n\n" + transactionLedgerForReview.ToMarkdown();
             }
 
             var summaryResponse = await CreateSummaryResponseAsync(
@@ -254,411 +249,445 @@ public sealed class OpenAiExecutionService : IAiExecutionService
             : $"{instructions.Trim()}{Environment.NewLine}{UntrustedContentDirective}";
     }
 
-    private async Task<TransactionReviewResult> ExtractPurchaseTransactionsAsync(
+    /*
+       Rules the transaction extractor must follow regardless of the database prompt's wording.
+       They define the output contract the C# ledger depends on (every row, a category for each row,
+       page + row position, and the printed summary of each statement).
+    */
+    private const string TransactionExtractionContract = """
+        OUTPUT CONTRACT (these rules take precedence over any other formatting instruction):
+
+        1. statements: one entry for every Account Summary / Activity Summary / Summary of Account Activity box in the chunk.
+           - summary_page: the page number from the page markers where that box is printed.
+           - account_identifier: the account number or "ending in" digits as printed, else null.
+           - period_start / period_end: the statement's billing period (open and closing dates) exactly as printed, else null.
+           - Copy each summary figure exactly as printed, including any sign or CR: previous_balance, payments, other_credits,
+             purchases, balance_transfers, cash_advances, other_debits, fees_charged, interest_charged, new_balance.
+             Use null for a line that is not printed. Never compute or infer a figure.
+           - purchases is the summary line that reports new purchases. Some issuers label it "Purchases", others
+             "Transactions" (for example Capital One) or "Purchases and Adjustments". Put that value in purchases and the
+             printed label in purchases_label. Never put cash advances, balance transfers, fees, interest or a balance there.
+
+        2. transactions: EVERY itemized row printed in EVERY transaction section of the chunk (purchases, payments,
+           credits, fees, interest charged, cash advances, balance transfers, other debits), plus every row of a
+           "Total Purchases" Date | Amount list.
+           - Do not skip, merge, summarize or de-duplicate rows. Two identical rows (same date, merchant and amount)
+             are two separate rows.
+           - source_page: the page the row is printed on. row_on_page: the row's position among itemized rows on that
+             page, counting from 1 at the top, in reading order across all sections on that page. Every row on a page
+             gets a different row_on_page.
+           - A row whose description wraps onto a second line (for example "CASH ADVANCE" or "CASH EQUIVALENT" under the
+             merchant) is ONE row; include the wrapped text in description.
+           - amount: exactly as printed, including $, commas, minus sign, parentheses or CR. Never re-format digits.
+           - section_heading: the heading the row is printed under, as printed.
+           - category, decided from the row itself and its section:
+             purchase = a purchase of goods or services from a merchant.
+             cash_advance = any row marked CASH ADVANCE or CASH EQUIVALENT, ATM or bank cash withdrawals, casino, gaming,
+               wagering or racetrack charges, lottery, money orders, wire transfers, traveler's checks, foreign cash,
+               overdraft advances.
+             balance_transfer = balance transfers and convenience checks.
+             fee = any fee (late, annual, cash advance fee, foreign transaction fee, returned payment).
+             interest = interest charges.
+             payment = payments to the account.
+             credit = refunds, returns, statement credits, rewards credits, adjustments that reduce the balance, charge-offs.
+             other_debit = any other debit that is not one of the above.
+             other = anything that does not fit, explained in description.
+             Rows in a section titled "Purchases and Other Debits" are NOT automatically purchases: classify each row.
+           - Section totals ("TOTAL THIS PERIOD", "Total Transactions for This Period", "Total Fees for This Period") are
+             not rows: put them in monetary_values.
+           - If the same purchases are printed both as itemized rows and again in a "Total Purchases" Date | Amount
+             list, extract the itemized rows as purchase and the list entries as other, with the description starting
+             "Listed again in Total Purchases:". A purchase is never extracted twice as purchase.
+
+        3. monetary_values: every other printed dollar amount that is not a transaction row and not one of the summary
+           figures above, with its printed label: section totals, credit line, available credit, minimum payment due,
+           past due amount, year-to-date totals, rewards balances, and Interest Charge Calculation table values (for
+           example "Interest Charge Calculation - PURCHASES Balance Subject to Interest Rate"). Copy amounts exactly as printed.
+
+        4. If a value cannot be read, use null for summary figures, and for a row put "[illegible]" in the description and the
+           amount exactly as visible; do not guess digits.
+        """;
+
+    private async Task<StatementLedger> ExtractStatementLedgerAsync(
         ResolvedAiSettings settings,
         PromptConfiguration promptConfiguration,
         string transactionExtractionInstructions,
         IReadOnlyCollection<EvidenceDocument> documents,
         CancellationToken cancellationToken)
     {
-        var chunks = DocumentChunkingService.CreateChunks(
-            documents,
-            ResolveEvidenceChunkMaxCharacters(),
-            ResolveChunkOverlap());
-        var extractedTransactions = new List<PurchaseTransaction>();
-        var extractedMonetaryValues = new List<MonetaryValue>();
-        for (var chunkIndex = 0; chunkIndex < chunks.Count; chunkIndex++)
-        {
-            var chunk = chunks[chunkIndex];
-            var chunkNumber = chunkIndex + 1;
-            var payload = BuildPayload(
-                settings.ModelName,
-                transactionExtractionInstructions,
-                [
-                    new Dictionary<string, object?>
-                    {
-                        ["type"] = "input_text",
-                        ["text"] = $"""
-Source document: {chunk.SourceFileName}
-Preserve one-based source pages from the page markers.
+        var instructions = $"{transactionExtractionInstructions.Trim()}{Environment.NewLine}{Environment.NewLine}{TransactionExtractionContract}";
+        var documentsById = documents.ToDictionary(document => document.DocumentId);
+        var units = StatementLedgerBuilder.CreateUnits(documents, ResolveTransactionChunkMaxCharacters());
 
-{FormatDocumentChunkForPrompt(chunk.Text)}
-"""
-                    }
-                ],
-                promptConfiguration.ReasoningEffort,
-                promptConfiguration.MaxOutputTokens ?? ResolveEvidenceMaxOutputTokens());
-            payload["text"] = BuildTransactionExtractionTextFormat();
-
-            var chunkJson = await SendResponsesRequestAsync(
-                settings,
-                payload,
-                "TransactionExtraction",
-                transactionExtractionInstructions,
-                $"Source document: {chunk.SourceFileName}{Environment.NewLine}Pages: {chunk.PageStart}-{chunk.PageEnd}{Environment.NewLine}{Environment.NewLine}{FormatDocumentChunkForPrompt(chunk.Text)}",
-                cancellationToken,
-                chunk.ChunkId,
-                chunkNumber,
-                chunks.Count);
-            var result = JsonSerializer.Deserialize<TransactionChunkResult>(chunkJson, TransactionJsonOptions)
-                ?? throw new InvalidOperationException($"Transaction extraction returned invalid JSON for '{chunk.ChunkId}'.");
-
-            foreach (var transaction in result.Transactions ?? [])
-            {
-                if (transaction.SourcePage < chunk.PageStart || transaction.SourcePage > chunk.PageEnd)
-                {
-                    throw new InvalidOperationException(
-                        $"Transaction extraction returned a source page outside '{chunk.ChunkId}'.");
-                }
-
-                var normalizedAmount = transaction.Amount
-                    .Trim()
-                    .TrimStart('$')
-                    .Replace(",", string.Empty, StringComparison.Ordinal);
-                if (!decimal.TryParse(
-                        normalizedAmount,
-                        NumberStyles.Number,
-                        CultureInfo.InvariantCulture,
-                        out var amount))
-                {
-                    throw new InvalidOperationException(
-                        $"Transaction amount '{transaction.Amount}' is not a valid decimal.");
-                }
-
-                extractedTransactions.Add(transaction with
-                {
-                    SourceDocument = chunk.SourceFileName,
-                    Amount = amount.ToString("0.00", CultureInfo.InvariantCulture)
-                });
-            }
-
-            foreach (var monetaryValue in result.MonetaryValues ?? [])
-            {
-                if (monetaryValue.SourcePage < chunk.PageStart || monetaryValue.SourcePage > chunk.PageEnd)
-                {
-                    throw new InvalidOperationException(
-                        $"Transaction extraction returned a source page outside '{chunk.ChunkId}'.");
-                }
-
-                extractedMonetaryValues.Add(monetaryValue with { SourceDocument = chunk.SourceFileName });
-            }
-        }
-
-        using var calcActivity = AiActivitySource.StartActivity("workflow.calculate_purchase_total", ActivityKind.Internal);
-        calcActivity?.SetTag("prompt.configuration_id", promptConfiguration.PromptConfigurationId);
-        calcActivity?.SetTag("workflow.calculation.name", "purchase_transaction_total");
-        calcActivity?.SetTag("workflow.calculation.source_document_count", documents.Count);
-        calcActivity?.SetTag(
-            "workflow.calculation.source_documents",
+        using var extractActivity = AiActivitySource.StartActivity("workflow.transaction_extraction", ActivityKind.Internal);
+        extractActivity?.SetTag("workflow.transaction_extraction.unit_count", units.Count);
+        extractActivity?.SetTag(
+            "workflow.transaction_extraction.source_documents",
             string.Join(", ", documents.Select(document => document.SourceFileName)));
-        calcActivity?.SetTag("workflow.calculation.chunk_count", chunks.Count);
-        calcActivity?.SetTag("workflow.calculation.transaction_count_extracted", extractedTransactions.Count);
-        calcActivity?.SetTag("workflow.calculation.monetary_value_count_extracted", extractedMonetaryValues.Count);
 
-        var transactions = extractedTransactions
-            .DistinctBy(transaction => (
-                transaction.SourceDocument,
-                transaction.SourcePage,
-                transaction.Date,
-                transaction.Description,
-                transaction.Amount))
-            .OrderBy(transaction => transaction.SourceDocument, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(transaction => transaction.Date, StringComparer.Ordinal)
-            .ToArray();
-        var monetaryValues = extractedMonetaryValues
-            .DistinctBy(monetaryValue => (
-                monetaryValue.SourceDocument,
-                monetaryValue.SourcePage,
-                monetaryValue.Label,
-                monetaryValue.Amount))
-            .OrderBy(monetaryValue => monetaryValue.SourceDocument, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(monetaryValue => monetaryValue.SourcePage)
-            .ToArray();
-        var sum = transactions.Sum(transaction =>
-            decimal.Parse(transaction.Amount, CultureInfo.InvariantCulture));
+        // 1. Extract every unit (bounded parallelism). Each unit is a whole statement or whole pages; nothing overlaps.
+        var extractions = await ExtractUnitsAsync(
+            settings, promptConfiguration, instructions, units, documentsById, feedback: null, cancellationToken);
+        var ledger = StatementLedgerBuilder.Build(extractions);
 
-        calcActivity?.SetTag("workflow.calculation.transaction_count_deduped", transactions.Length);
-        calcActivity?.SetTag(
-            "workflow.calculation.transaction_count_duplicates_removed",
-            extractedTransactions.Count - transactions.Length);
-        calcActivity?.SetTag("workflow.calculation.monetary_value_count_deduped", monetaryValues.Length);
-        calcActivity?.SetTag(
-            "workflow.calculation.monetary_value_count_duplicates_removed",
-            extractedMonetaryValues.Count - monetaryValues.Length);
-        calcActivity?.SetTag("workflow.calculation.breakdown_format", "human_readable_ledger_and_ordered_events");
-        calcActivity?.SetTag(
-            "workflow.calculation.breakdown",
-            TruncateForTrace(BuildCalculationTraceBreakdown(
-                extractedTransactions.Count,
-                transactions,
-                extractedMonetaryValues.Count,
-                monetaryValues,
-                sum)));
-        calcActivity?.SetTag(
-            "workflow.calculation.transactions_used_for_total",
-            TruncateForTrace(JsonSerializer.Serialize(transactions.Select((transaction, index) => new
-            {
-                Step = index + 1,
-                transaction.SourceDocument,
-                transaction.SourcePage,
-                transaction.Date,
-                transaction.Description,
-                transaction.Amount
-            }), JsonOptions)));
-        calcActivity?.SetTag("workflow.calculation.output_total_purchases", sum);
-        calcActivity?.AddEvent(new ActivityEvent(
-            "workflow.calculation.deduplication_complete",
-            tags: new ActivityTagsCollection
-            {
-                ["extracted_transaction_count"] = extractedTransactions.Count,
-                ["included_transaction_count"] = transactions.Length,
-                ["duplicate_transaction_count"] = extractedTransactions.Count - transactions.Length,
-                ["extracted_monetary_value_count"] = extractedMonetaryValues.Count,
-                ["observed_monetary_value_count"] = monetaryValues.Length,
-                ["duplicate_monetary_value_count"] = extractedMonetaryValues.Count - monetaryValues.Length
-            }));
-        AddCalculationBreakdownEvents(calcActivity, transactions, monetaryValues, sum);
-        if (transactions.Length == 0 && monetaryValues.Length > 0)
+        // 2. Reconcile. Every unit holding pages of a statement that does not match its printed summary is
+        //    re-extracted with the specific mismatch. The retry is kept only if more statements reconcile overall
+        //    and no statement that already reconciled stops reconciling.
+        var reconciliationPasses = ResolveLedgerReconciliationRetryCount();
+        for (var pass = 1; pass <= reconciliationPasses; pass++)
         {
-            calcActivity?.SetTag(
-                "workflow.calculation.note",
-                "No transaction rows were extracted, so the purchase total is 0 even though summary values were found.");
-        }
-        calcActivity?.AddEvent(new ActivityEvent(
-            "workflow.calculation.summary",
-            tags: new ActivityTagsCollection
-            {
-                ["source_documents"] = string.Join(", ", documents.Select(document => document.SourceFileName)),
-                ["transaction_count"] = transactions.Length,
-                ["total_purchases"] = sum
-            }));
+            var failing = ledger.Statements
+                .Where(item => item.Status is StatementStatus.Mismatch or StatementStatus.SummaryOnly)
+                .ToList();
+            if (failing.Count == 0)
+                break;
 
-        return new TransactionReviewResult(
-            transactions,
-            sum.ToString("0.00", CultureInfo.InvariantCulture),
-            monetaryValues);
+            var improvedAny = false;
+            foreach (var item in failing)
+            {
+                var statementPages = StatementPages(ledger, item);
+                var targets = extractions
+                    .Where(extraction =>
+                        extraction.Unit.DocumentId == item.Statement.DocumentId &&
+                        extraction.Unit.Pages.Any(statementPages.Contains))
+                    .ToList();
+                if (targets.Count == 0)
+                    continue;
+
+                List<UnitExtraction> retried;
+                try
+                {
+                    retried = await ExtractUnitsAsync(
+                        settings,
+                        promptConfiguration,
+                        instructions,
+                        targets.Select(target => target.Unit).ToList(),
+                        documentsById,
+                        BuildReconciliationFeedback(item),
+                        cancellationToken);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    // The first extraction is still a complete ledger; a failed optional retry must not fail the review.
+                    _logger.LogWarning(
+                        exception,
+                        "Reconciliation re-extraction failed for the statement on page {Page} of {Document}; keeping the first extraction.",
+                        item.Statement.SummaryPage,
+                        item.Statement.SourceDocument);
+                    continue;
+                }
+
+                var targetIds = targets.Select(target => target.Unit.UnitId).ToHashSet(StringComparer.Ordinal);
+                var candidate = extractions
+                    .Where(extraction => !targetIds.Contains(extraction.Unit.UnitId))
+                    .Concat(retried)
+                    .ToList();
+                var candidateLedger = StatementLedgerBuilder.Build(candidate);
+
+                if (IsBetterReconciled(candidateLedger, ledger))
+                {
+                    extractions = candidate;
+                    ledger = candidateLedger;
+                    improvedAny = true;
+                }
+            }
+
+            if (!improvedAny)
+                break;
+        }
+
+        RecordLedgerTelemetry(ledger, documents, units.Count);
+        return ledger;
     }
 
-    private static void AddCalculationBreakdownEvents(
-        Activity? activity,
-        IReadOnlyList<PurchaseTransaction> transactions,
-        IReadOnlyList<MonetaryValue> monetaryValues,
-        decimal total)
+    // Pages that belong to a statement: its summary page and every page holding one of its rows, plus the pages of
+    // its statement block (so a page whose rows were all missed is still re-read).
+    private static HashSet<int> StatementPages(StatementLedger ledger, LedgerStatementResult item)
     {
-        if (activity is null)
-        {
-            return;
-        }
+        var statement = item.Statement;
+        var pages = ledger.Rows
+            .Where(row => row.DocumentId == statement.DocumentId && row.OwnerSummaryPage == statement.SummaryPage)
+            .Select(row => row.SourcePage)
+            .ToHashSet();
+        pages.Add(statement.SummaryPage);
 
-        var runningTotal = 0m;
-        for (var index = 0; index < transactions.Count; index++)
-        {
-            var transaction = transactions[index];
-            var amount = decimal.Parse(transaction.Amount, CultureInfo.InvariantCulture);
-            var previousTotal = runningTotal;
-            runningTotal += amount;
+        var nextSummary = ledger.Statements
+            .Where(other => other.Statement.DocumentId == statement.DocumentId && other.Statement.SummaryPage > statement.SummaryPage)
+            .Select(other => (int?)other.Statement.SummaryPage)
+            .Min();
+        var lastPage = nextSummary.HasValue ? nextSummary.Value - 1 : pages.Max();
+        for (var page = statement.SummaryPage; page <= lastPage; page++)
+            pages.Add(page);
 
-            activity.AddEvent(new ActivityEvent(
-                "workflow.calculation.transaction_included",
-                tags: new ActivityTagsCollection
-                {
-                    ["step"] = index + 1,
-                    ["source_document"] = transaction.SourceDocument,
-                    ["source_page"] = transaction.SourcePage,
-                    ["date"] = transaction.Date,
-                    ["description"] = transaction.Description,
-                    ["amount"] = amount,
-                    ["running_total_before"] = previousTotal,
-                    ["running_total_after"] = runningTotal,
-                    ["operation"] = $"{previousTotal:0.00} + {amount:0.00} = {runningTotal:0.00}"
-                }));
-        }
-
-        foreach (var monetaryValue in monetaryValues)
-        {
-            activity.AddEvent(new ActivityEvent(
-                "workflow.calculation.monetary_value_observed",
-                tags: new ActivityTagsCollection
-                {
-                    ["source_document"] = monetaryValue.SourceDocument,
-                    ["source_page"] = monetaryValue.SourcePage,
-                    ["label"] = monetaryValue.Label,
-                    ["amount"] = monetaryValue.Amount,
-                    ["included_in_total"] = false,
-                    ["reason"] = "Printed monetary values are captured for review but are not purchase transactions."
-                }));
-        }
-
-        activity.AddEvent(new ActivityEvent(
-            "workflow.calculation.total_computed",
-            tags: new ActivityTagsCollection
-            {
-                ["formula"] = "sum(included purchase transactions)",
-                ["included_transaction_count"] = transactions.Count,
-                ["total_purchases"] = total,
-                ["recomputed_total_purchases"] = runningTotal
-            }));
+        return pages;
     }
 
-    private static string BuildCalculationTraceBreakdown(
-        int extractedTransactionCount,
-        IReadOnlyList<PurchaseTransaction> transactions,
-        int extractedMonetaryValueCount,
-        IReadOnlyList<MonetaryValue> monetaryValues,
-        decimal total)
+    private static bool IsBetterReconciled(StatementLedger candidate, StatementLedger current)
     {
+        static (long, int) Key(LedgerStatementResult item) => (item.Statement.DocumentId, item.Statement.SummaryPage);
+
+        var currentReconciled = current.Statements
+            .Where(item => item.Status == StatementStatus.Reconciled)
+            .Select(Key)
+            .ToHashSet();
+        var candidateReconciled = candidate.Statements
+            .Where(item => item.Status == StatementStatus.Reconciled)
+            .Select(Key)
+            .ToHashSet();
+
+        return candidateReconciled.IsSupersetOf(currentReconciled) &&
+               candidateReconciled.Count > currentReconciled.Count;
+    }
+
+    private async Task<List<UnitExtraction>> ExtractUnitsAsync(
+        ResolvedAiSettings settings,
+        PromptConfiguration promptConfiguration,
+        string instructions,
+        IReadOnlyList<TransactionExtractionUnit> units,
+        IReadOnlyDictionary<long, EvidenceDocument> documentsById,
+        string? feedback,
+        CancellationToken cancellationToken)
+    {
+        using var throttle = new SemaphoreSlim(ResolveMaxParallelEvidenceCalls());
+        var tasks = units.Select(async (unit, index) =>
+        {
+            await throttle.WaitAsync(cancellationToken);
+            try
+            {
+                return await ExtractUnitWithRetryAsync(
+                    settings, promptConfiguration, instructions, unit, index + 1, units.Count,
+                    documentsById, feedback, allowPageSplit: true, cancellationToken);
+            }
+            finally
+            {
+                throttle.Release();
+            }
+        });
+
+        var results = await Task.WhenAll(tasks);
+        return results.SelectMany(result => result).ToList();
+    }
+
+    private async Task<IReadOnlyList<UnitExtraction>> ExtractUnitWithRetryAsync(
+        ResolvedAiSettings settings,
+        PromptConfiguration promptConfiguration,
+        string instructions,
+        TransactionExtractionUnit unit,
+        int unitNumber,
+        int unitCount,
+        IReadOnlyDictionary<long, EvidenceDocument> documentsById,
+        string? feedback,
+        bool allowPageSplit,
+        CancellationToken cancellationToken)
+    {
+        var attempts = ResolveEvidenceRetryCount() + 1;
+        UnitValidation? lastValidation = null;
+        string? validationFeedback = null;
+
+        for (var attempt = 1; attempt <= attempts; attempt++)
+        {
+            TransactionExtractionResult result;
+            try
+            {
+                result = await CallTransactionExtractionAsync(
+                    settings, promptConfiguration, instructions, unit, unitNumber, unitCount,
+                    CombineFeedback(feedback, validationFeedback), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (InvalidOperationException exception) when (
+                allowPageSplit &&
+                unit.Pages.Count > 1 &&
+                exception.Message.Contains("incomplete", StringComparison.OrdinalIgnoreCase))
+            {
+                // The response hit the output limit. Re-extract page by page so nothing is cut off.
+                _logger.LogWarning(
+                    "Transaction extraction for {UnitId} was cut off; re-extracting {PageCount} pages individually.",
+                    unit.UnitId,
+                    unit.Pages.Count);
+                var pageResults = new List<UnitExtraction>();
+                foreach (var pageUnit in StatementLedgerBuilder.SplitIntoPages(unit, documentsById[unit.DocumentId]))
+                {
+                    pageResults.AddRange(await ExtractUnitWithRetryAsync(
+                        settings, promptConfiguration, instructions, pageUnit, unitNumber, unitCount,
+                        documentsById, feedback, allowPageSplit: false, cancellationToken));
+                }
+
+                return pageResults;
+            }
+            catch (Exception exception) when (attempt < attempts || lastValidation is not null)
+            {
+                _logger.LogWarning(
+                    exception,
+                    "Transaction extraction attempt {Attempt}/{Attempts} failed for {UnitId}.",
+                    attempt,
+                    attempts,
+                    unit.UnitId);
+                if (attempt == attempts)
+                    break; // An earlier attempt returned a usable (partly valid) answer; use it below.
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), cancellationToken);
+                continue;
+            }
+
+            lastValidation = StatementLedgerBuilder.Validate(unit, result);
+            if (lastValidation.IsValid)
+                return [new UnitExtraction(unit, lastValidation.Sanitized, [])];
+
+            _logger.LogWarning(
+                "Transaction extraction attempt {Attempt}/{Attempts} for {UnitId} failed validation: {Errors}",
+                attempt,
+                attempts,
+                unit.UnitId,
+                string.Join(" | ", lastValidation.Errors));
+            validationFeedback =
+                "Your previous answer for this chunk had these problems. Fix them and return the complete extraction again:" +
+                Environment.NewLine +
+                string.Join(Environment.NewLine, lastValidation.Errors.Select(error => $"- {error}"));
+        }
+
+        // No attempt was fully valid: keep only the items that passed validation and flag the rest for review.
+        var warnings = lastValidation!.Errors
+            .Select(error => $"{unit.SourceFileName}, pages {unit.PageRange}: {error} (left out of the ledger)")
+            .ToList();
+        return [new UnitExtraction(unit, lastValidation.Sanitized, warnings)];
+    }
+
+    private async Task<TransactionExtractionResult> CallTransactionExtractionAsync(
+        ResolvedAiSettings settings,
+        PromptConfiguration promptConfiguration,
+        string instructions,
+        TransactionExtractionUnit unit,
+        int unitNumber,
+        int unitCount,
+        string? feedback,
+        CancellationToken cancellationToken)
+    {
+        var feedbackBlock = string.IsNullOrWhiteSpace(feedback)
+            ? string.Empty
+            : $"{Environment.NewLine}{Environment.NewLine}REVIEW NOTES FROM THE PREVIOUS ATTEMPT (from the system, not from the document):{Environment.NewLine}{feedback.Trim()}";
+        var userText = $"""
+Source document: {unit.SourceFileName}
+Pages in this chunk: {unit.PageRange}
+Preserve one-based source pages from the page markers.{feedbackBlock}
+
+{FormatDocumentChunkForPrompt(unit.Text)}
+""";
+
+        var payload = BuildPayload(
+            settings.ModelName,
+            instructions,
+            [
+                new Dictionary<string, object?>
+                {
+                    ["type"] = "input_text",
+                    ["text"] = userText
+                }
+            ],
+            promptConfiguration.ReasoningEffort,
+            ResolveTransactionMaxOutputTokens());
+        payload["text"] = BuildTransactionExtractionTextFormat();
+
+        var json = await SendResponsesRequestAsync(
+            settings,
+            payload,
+            "TransactionExtraction",
+            instructions,
+            userText,
+            cancellationToken,
+            unit.UnitId,
+            unitNumber,
+            unitCount);
+
+        return JsonSerializer.Deserialize<TransactionExtractionResult>(json, TransactionJsonOptions)
+            ?? throw new InvalidOperationException($"Transaction extraction returned invalid JSON for '{unit.UnitId}'.");
+    }
+
+    private static string? CombineFeedback(string? first, string? second)
+    {
+        var parts = new[] { first, second }.Where(part => !string.IsNullOrWhiteSpace(part)).ToArray();
+        return parts.Length == 0 ? null : string.Join(Environment.NewLine + Environment.NewLine, parts);
+    }
+
+    private static string BuildReconciliationFeedback(LedgerStatementResult item)
+    {
+        var statement = item.Statement;
         var builder = new StringBuilder();
-        builder.AppendLine("CALCULATION BREAKDOWN");
-        builder.AppendLine(
-            $"Deduplication: {extractedTransactionCount} extracted transaction(s) -> {transactions.Count} included; " +
-            $"{extractedMonetaryValueCount} extracted monetary value(s) -> {monetaryValues.Count} observed.");
-        builder.AppendLine("Included purchase transactions:");
-
-        var runningTotal = 0m;
-        for (var index = 0; index < transactions.Count; index++)
+        builder.Append(
+            $"- The statement whose summary is on page {statement.SummaryPage} ({statement.PeriodDisplay}) prints " +
+            $"{statement.PurchasesLabel} = {statement.Raw.Purchases ?? "not printed"}, but the rows you labelled purchase add up to " +
+            $"{StatementLedgerBuilder.FormatMoney(item.ItemizedPurchases)} across {item.PurchaseRowCount} row(s).");
+        if (statement.CashAdvances is decimal printedAdvances)
         {
-            var transaction = transactions[index];
-            var amount = decimal.Parse(transaction.Amount, CultureInfo.InvariantCulture);
-            var previousTotal = runningTotal;
-            runningTotal += amount;
-            builder.AppendLine(
-                $"{index + 1}. {transaction.SourceDocument}, page {transaction.SourcePage}: " +
-                $"{transaction.Date ?? "Date unavailable"} | {transaction.Description} | " +
-                $"{previousTotal:0.00} + {amount:0.00} = {runningTotal:0.00}");
+            builder.Append(
+                $" The summary prints Cash Advances = {statement.Raw.CashAdvances}; rows labelled cash_advance add up to " +
+                $"{StatementLedgerBuilder.FormatMoney(item.ItemizedCashAdvances)}.");
         }
 
-        if (transactions.Count == 0)
-        {
-            builder.AppendLine("None.");
-        }
-
-        builder.AppendLine("Observed monetary values (excluded from total):");
-        foreach (var monetaryValue in monetaryValues)
-        {
-            builder.AppendLine(
-                $"- {monetaryValue.SourceDocument}, page {monetaryValue.SourcePage}: " +
-                $"{monetaryValue.Label} = {monetaryValue.Amount}");
-        }
-
-        if (monetaryValues.Count == 0)
-        {
-            builder.AppendLine("None.");
-        }
-
-        builder.Append($"Total purchases: {runningTotal:0.00} (computed total: {total:0.00})");
+        builder.Append(
+            " Re-read every itemized row on this statement's pages, including continuation pages and repeated identical rows, " +
+            "check each row's category (cash advances and cash-equivalent rows are not purchases), and re-check the printed summary figures. " +
+            "Do not change a value to force a match; report exactly what is printed.");
         return builder.ToString();
     }
 
-    private static string BuildTransactionLedgerText(
-        IReadOnlyCollection<PurchaseTransaction> transactions,
-        string calculatedSum,
-        IReadOnlyCollection<MonetaryValue> monetaryValues)
-    {
-        var builder = new StringBuilder();
-        builder.AppendLine("STATEMENT LEDGER");
-        builder.AppendLine("TotalPurchases below is computed from individual purchase rows only. Monetary values are listed as printed and are not recalculated.");
-        builder.AppendLine();
-        builder.AppendLine("COMPUTED SUMMARY");
-        builder.AppendLine($"TotalPurchases: ${calculatedSum}");
-        builder.AppendLine($"TransactionCount: {transactions.Count}");
-        builder.AppendLine();
-        builder.AppendLine("TRANSACTIONS");
-        builder.AppendLine("Date | Description | Purchase | Source Document | Source Page");
-        foreach (var transaction in transactions)
-        {
-            builder.AppendLine(
-                $"{transaction.Date ?? "Not available"} | {transaction.Description} | ${transaction.Amount} | " +
-                $"{transaction.SourceDocument} | {transaction.SourcePage}");
-        }
-
-        builder.AppendLine();
-        builder.AppendLine("MONETARY VALUES");
-        if (monetaryValues.Count == 0)
-        {
-            builder.AppendLine("None found.");
-        }
-        else
-        {
-            builder.AppendLine("Label | Amount | Source Document | Source Page");
-            foreach (var monetaryValue in monetaryValues)
-            {
-                builder.AppendLine(
-                    $"{monetaryValue.Label} | {monetaryValue.Amount} | {monetaryValue.SourceDocument} | {monetaryValue.SourcePage}");
-            }
-        }
-
-        return builder.ToString().Trim();
-    }
-
-    private static string BuildTransactionMarkdown(
+    private void RecordLedgerTelemetry(
+        StatementLedger ledger,
         IReadOnlyCollection<EvidenceDocument> documents,
-        IReadOnlyCollection<PurchaseTransaction> transactions,
-        decimal sum,
-        IReadOnlyCollection<MonetaryValue> monetaryValues,
-        string json)
+        int unitCount)
     {
-        var citedPages = transactions.Count > 0
-            ? transactions
-                .Select(transaction => (transaction.SourceDocument, transaction.SourcePage))
-                .Distinct()
-            : documents
-                .SelectMany(document => document.Extraction.Pages.Select(page =>
-                    (SourceDocument: document.SourceFileName, SourcePage: page.PageNumber)));
-        var citations = string.Join(' ', citedPages.Select(source =>
-            $"[{source.SourceDocument}, page {source.SourcePage}]"));
-        var builder = new StringBuilder();
+        using var calcActivity = AiActivitySource.StartActivity("workflow.calculate_purchase_total", ActivityKind.Internal);
+        if (calcActivity is null)
+            return;
 
-        builder.AppendLine("## Transaction Summary");
-        builder.AppendLine(transactions.Count == 0
-            ? $"- No individual purchase transactions were found. {citations}"
-            : $"- Extracted **{transactions.Count}** individual purchase transactions. {citations}");
-        builder.AppendLine($"- Calculated transaction sum: **${sum.ToString("0.00", CultureInfo.InvariantCulture)}**. {citations}");
-        builder.AppendLine();
-        builder.AppendLine("## Transactions");
-        builder.AppendLine("| Date | Description | Amount | Source |");
-        builder.AppendLine("|---|---|---:|---|");
+        calcActivity.SetTag("workflow.calculation.name", "purchase_transaction_total");
+        calcActivity.SetTag("workflow.calculation.source_document_count", documents.Count);
+        calcActivity.SetTag(
+            "workflow.calculation.source_documents",
+            string.Join(", ", documents.Select(document => document.SourceFileName)));
+        calcActivity.SetTag("workflow.calculation.unit_count", unitCount);
+        calcActivity.SetTag("workflow.calculation.ledger_status", ledger.Status);
+        calcActivity.SetTag("workflow.calculation.statement_count", ledger.Statements.Count);
+        calcActivity.SetTag(
+            "workflow.calculation.statements_reconciled",
+            ledger.Statements.Count(item => item.Status == StatementStatus.Reconciled));
+        calcActivity.SetTag("workflow.calculation.row_count", ledger.Rows.Count);
+        calcActivity.SetTag("workflow.calculation.purchase_row_count", ledger.Rows.Count(ledger.IsRowCounted));
+        calcActivity.SetTag("workflow.calculation.monetary_value_count", ledger.MonetaryValues.Count);
+        calcActivity.SetTag("workflow.calculation.output_total_purchases", ledger.TotalPurchases);
+        calcActivity.SetTag("workflow.calculation.itemized_purchase_total", ledger.ItemizedPurchaseTotal);
+        calcActivity.SetTag("workflow.calculation.warning_count", ledger.Warnings.Count);
+        calcActivity.SetTag("workflow.calculation.breakdown", TruncateForTrace(ledger.ToLedgerText()));
 
-        if (transactions.Count == 0)
+        foreach (var item in ledger.Statements)
         {
-            builder.AppendLine($"| — | No individual purchase transactions found | $0.00 | {citations} |");
-        }
-        else
-        {
-            foreach (var transaction in transactions)
-            {
-                builder.AppendLine(
-                    $"| {EscapeMarkdownCell(transaction.Date ?? "Not available")} | " +
-                    $"{EscapeMarkdownCell(transaction.Description)} | " +
-                    $"${transaction.Amount} | [{transaction.SourceDocument}, page {transaction.SourcePage}] |");
-            }
-        }
-
-        builder.AppendLine();
-        builder.AppendLine("## Monetary Values");
-        builder.AppendLine("Captured as printed on the statement; not recalculated or included in TotalPurchases.");
-        builder.AppendLine("| Label | Amount | Source |");
-        builder.AppendLine("|---|---:|---|");
-
-        if (monetaryValues.Count == 0)
-        {
-            builder.AppendLine("| — | — | None found |");
-        }
-        else
-        {
-            foreach (var monetaryValue in monetaryValues)
-            {
-                builder.AppendLine(
-                    $"| {EscapeMarkdownCell(monetaryValue.Label)} | " +
-                    $"{EscapeMarkdownCell(monetaryValue.Amount)} | [{monetaryValue.SourceDocument}, page {monetaryValue.SourcePage}] |");
-            }
+            calcActivity.AddEvent(new ActivityEvent(
+                "workflow.calculation.statement",
+                tags: new ActivityTagsCollection
+                {
+                    ["source_document"] = item.Statement.SourceDocument,
+                    ["summary_page"] = item.Statement.SummaryPage,
+                    ["period"] = item.Statement.PeriodDisplay,
+                    ["printed_purchases"] = item.Statement.Raw.Purchases,
+                    ["itemized_purchases"] = item.ItemizedPurchases,
+                    ["purchases_used"] = item.CountsTowardTotal ? item.PurchasesUsed : 0m,
+                    ["status"] = item.Status.ToString(),
+                    ["note"] = item.StatusNote
+                }));
         }
 
-        builder.AppendLine();
-        return builder.ToString().Trim();
+        foreach (var warning in ledger.Warnings)
+        {
+            calcActivity.AddEvent(new ActivityEvent(
+                "workflow.calculation.warning",
+                tags: new ActivityTagsCollection { ["message"] = warning }));
+        }
+
+        calcActivity.SetStatus(ActivityStatusCode.Ok);
     }
 
-    private static string EscapeMarkdownCell(string value) =>
-        value.Replace("|", "\\|").Replace("\r", " ").Replace("\n", " ");
 
     public async Task<string> GenerateSuggestedPromptReviewAsync(
         PromptConfiguration promptConfiguration,
@@ -1248,13 +1277,88 @@ Pages: {chunk.PageStart}-{chunk.PageEnd}
 
     private static Dictionary<string, object?> BuildTransactionExtractionTextFormat()
     {
-        var stringProperty = new Dictionary<string, object?> { ["type"] = "string" };
+        static Dictionary<string, object?> Text(string description) => new()
+        {
+            ["type"] = "string",
+            ["description"] = description
+        };
+
+        static Dictionary<string, object?> NullableText(string description) => new()
+        {
+            ["type"] = new[] { "string", "null" },
+            ["description"] = description
+        };
+
+        static Dictionary<string, object?> Integer(string description) => new()
+        {
+            ["type"] = "integer",
+            ["description"] = description
+        };
+
+        static Dictionary<string, object?> ArrayOf(Dictionary<string, object?> properties) => new()
+        {
+            ["type"] = "array",
+            ["items"] = new Dictionary<string, object?>
+            {
+                ["type"] = "object",
+                ["additionalProperties"] = false,
+                ["properties"] = properties,
+                ["required"] = properties.Keys.ToArray()
+            }
+        };
+
+        const string printed = "Exactly as printed, including $, commas, sign or CR; null if not printed.";
+
+        var statementProperties = new Dictionary<string, object?>
+        {
+            ["summary_page"] = Integer("Page number (from the page markers) where this Account/Activity Summary is printed."),
+            ["account_identifier"] = NullableText("Account number or 'ending in' digits as printed."),
+            ["period_start"] = NullableText("Billing period start (open date) as printed."),
+            ["period_end"] = NullableText("Billing period end (closing date) as printed."),
+            ["previous_balance"] = NullableText(printed),
+            ["payments"] = NullableText(printed),
+            ["other_credits"] = NullableText(printed),
+            ["purchases_label"] = NullableText("Printed label of the purchases line, e.g. 'Purchases' or 'Transactions'."),
+            ["purchases"] = NullableText("The summary line reporting new purchases. " + printed),
+            ["balance_transfers"] = NullableText(printed),
+            ["cash_advances"] = NullableText(printed),
+            ["other_debits"] = NullableText(printed),
+            ["fees_charged"] = NullableText(printed),
+            ["interest_charged"] = NullableText(printed),
+            ["new_balance"] = NullableText(printed)
+        };
+
+        var rowProperties = new Dictionary<string, object?>
+        {
+            ["source_page"] = Integer("Page number (from the page markers) the row is printed on."),
+            ["row_on_page"] = Integer("1-based position of this row among all itemized rows on its page, top to bottom. Unique per page."),
+            ["section_heading"] = NullableText("Heading the row is printed under, as printed."),
+            ["transaction_date"] = NullableText("Transaction date as printed."),
+            ["post_date"] = NullableText("Post date as printed."),
+            ["reference_number"] = NullableText("Reference number as printed."),
+            ["description"] = Text("Description as printed, including any wrapped second line."),
+            ["amount"] = Text("Amount exactly as printed, including $, commas, sign, parentheses or CR."),
+            ["category"] = new Dictionary<string, object?>
+            {
+                ["type"] = "string",
+                ["enum"] = StatementLedgerBuilder.Categories,
+                ["description"] = "What the row is. Only 'purchase' rows count toward total purchases."
+            }
+        };
+
+        var valueProperties = new Dictionary<string, object?>
+        {
+            ["source_page"] = Integer("Page number (from the page markers) where the amount is printed."),
+            ["label"] = Text("The printed label, with its section, e.g. 'TOTAL THIS PERIOD (Purchases and Other Debits)'."),
+            ["amount"] = Text("Amount exactly as printed.")
+        };
+
         return new Dictionary<string, object?>
         {
             ["format"] = new Dictionary<string, object?>
             {
                 ["type"] = "json_schema",
-                ["name"] = "purchase_transactions",
+                ["name"] = "statement_ledger_extraction",
                 ["strict"] = true,
                 ["schema"] = new Dictionary<string, object?>
                 {
@@ -1262,52 +1366,11 @@ Pages: {chunk.PageStart}-{chunk.PageEnd}
                     ["additionalProperties"] = false,
                     ["properties"] = new Dictionary<string, object?>
                     {
-                        ["has_purchase_transactions"] = new Dictionary<string, object?>
-                        {
-                            ["type"] = "boolean"
-                        },
-                        ["transactions"] = new Dictionary<string, object?>
-                        {
-                            ["type"] = "array",
-                            ["items"] = new Dictionary<string, object?>
-                            {
-                                ["type"] = "object",
-                                ["additionalProperties"] = false,
-                                ["properties"] = new Dictionary<string, object?>
-                                {
-                                    ["source_document"] = stringProperty,
-                                    ["source_page"] = new Dictionary<string, object?> { ["type"] = "integer" },
-                                    ["date"] = new Dictionary<string, object?>
-                                    {
-                                        ["type"] = new[] { "string", "null" }
-                                    },
-                                    ["description"] = stringProperty,
-                                    ["amount"] = stringProperty
-                                },
-                                ["required"] = new[]
-                                {
-                                    "source_document", "source_page", "date", "description", "amount"
-                                }
-                            }
-                        },
-                        ["monetary_values"] = new Dictionary<string, object?>
-                        {
-                            ["type"] = "array",
-                            ["items"] = new Dictionary<string, object?>
-                            {
-                                ["type"] = "object",
-                                ["additionalProperties"] = false,
-                                ["properties"] = new Dictionary<string, object?>
-                                {
-                                    ["source_page"] = new Dictionary<string, object?> { ["type"] = "integer" },
-                                    ["label"] = stringProperty,
-                                    ["amount"] = stringProperty
-                                },
-                                ["required"] = new[] { "source_page", "label", "amount" }
-                            }
-                        }
+                        ["statements"] = ArrayOf(statementProperties),
+                        ["transactions"] = ArrayOf(rowProperties),
+                        ["monetary_values"] = ArrayOf(valueProperties)
                     },
-                    ["required"] = new[] { "has_purchase_transactions", "transactions", "monetary_values" }
+                    ["required"] = new[] { "statements", "transactions", "monetary_values" }
                 }
             }
         };
@@ -1933,6 +1996,17 @@ Pages: {chunk.PageStart}-{chunk.PageEnd}
     private int ResolveEvidenceRetryCount() =>
         Math.Max(0, _configuration.GetValue<int?>(EvidenceRetryCountKey) ?? 2);
 
+    // Transaction extraction units are smaller than evidence chunks so a whole statement fits in one call
+    // and its full row list fits in the output budget.
+    private int ResolveTransactionChunkMaxCharacters() =>
+        Math.Max(2_000, _configuration.GetValue<int?>(TransactionChunkMaxCharactersKey) ?? 24_000);
+
+    private int ResolveTransactionMaxOutputTokens() =>
+        Math.Max(4_000, _configuration.GetValue<int?>(TransactionMaxOutputTokensKey) ?? 32_000);
+
+    private int ResolveLedgerReconciliationRetryCount() =>
+        Math.Max(0, _configuration.GetValue<int?>(LedgerReconciliationRetryCountKey) ?? 1);
+
     private int ResolveEvidenceMaxOutputTokens() =>
         ResolveRequiredPositiveInt(EvidenceMaxOutputTokensKey);
 
@@ -2102,32 +2176,6 @@ Pages: {chunk.PageStart}-{chunk.PageEnd}
         string FileId,
         string FileName);
 
-    private sealed record TransactionChunkResult(
-        bool HasPurchaseTransactions,
-        IReadOnlyList<PurchaseTransaction>? Transactions,
-        IReadOnlyList<MonetaryValue>? MonetaryValues);
-
-    private sealed record TransactionReviewResult(
-        IReadOnlyList<PurchaseTransaction> Transactions,
-        string CalculatedSum,
-        IReadOnlyList<MonetaryValue> MonetaryValues)
-    {
-        public bool HasExtractedValues => Transactions.Count > 0 || MonetaryValues.Count > 0;
-    }
-
-    private sealed record PurchaseTransaction(
-        string SourceDocument,
-        int SourcePage,
-        string? Date,
-        string Description,
-        string Amount);
-
-    private sealed record MonetaryValue(
-        int SourcePage,
-        string Label,
-        string Amount,
-        string SourceDocument = "");
-
     private sealed record OpenAiRequestTraceContext(
         string PromptName,
         string SystemPrompt,
@@ -2149,7 +2197,7 @@ Pages: {chunk.PageStart}-{chunk.PageEnd}
     {
         public ResolvedAiSettings? Settings { get; set; }
         public List<EvidenceDocument>? EvidenceDocuments { get; set; }
-        public TransactionReviewResult? TransactionLedger { get; set; }
+        public StatementLedger? TransactionLedger { get; set; }
         public List<ExtractedTextFile>? ExtractedTextFiles { get; set; }
         public EvidenceDigest? EvidenceDigest { get; set; }
         public VectorStoreResources? VectorResources { get; set; }

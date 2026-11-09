@@ -10,6 +10,7 @@ namespace api.Services;
 public class ReviewService : IReviewService
 {
     private const string CompletedStatus = "COMPLETED";
+    private const string CanceledStatus = "CANCELED";
     private const string LegacyTestOutputPrefix = "TEST OUTPUT:";
 
     private readonly DivertCheckDbContext _db;
@@ -48,9 +49,73 @@ public class ReviewService : IReviewService
                     .ToArray()))
             .ToListAsync(cancellationToken);
 
+        var pendingReviewsByCase = await GetPendingReviewsByCaseAsync(latestReviews, cancellationToken);
+
         return latestReviews
-            .Select(response => response.ToViewModel())
+            .Select(response => response.ToViewModel(pendingReviewsByCase.GetValueOrDefault(response.CaseId)))
             .ToArray();
+    }
+
+    /*
+       The queue row shows the latest completed review, but a newer rerun that is still queued,
+       running, or failed already owns the case's current document set. Return that run's documents
+       so the page keeps showing newly added files after a refresh. Canceled runs are skipped because
+       cancellation deletes the documents they uploaded.
+    */
+    private async Task<Dictionary<long, PendingReviewViewModel>> GetPendingReviewsByCaseAsync(
+        IReadOnlyCollection<ReviewQueueRow> latestReviews,
+        CancellationToken cancellationToken)
+    {
+        var displayedResponseIds = latestReviews.Select(response => response.AiResponseId).ToHashSet();
+        var caseIds = latestReviews.Select(response => response.CaseId).Distinct().ToArray();
+
+        var newestResponseIds = await CreateActiveResponsesQuery()
+            .Where(response => caseIds.Contains(response.CaseId))
+            .GroupBy(response => response.CaseId)
+            .Select(group => group
+                .OrderByDescending(response => response.CreatedDttm)
+                .ThenByDescending(response => response.AiResponseId)
+                .Select(response => response.AiResponseId)
+                .First())
+            .ToListAsync(cancellationToken);
+
+        var pendingResponseIds = newestResponseIds
+            .Where(responseId => !displayedResponseIds.Contains(responseId))
+            .ToArray();
+
+        if (pendingResponseIds.Length == 0)
+            return [];
+
+        var pendingReviews = await CreateActiveResponsesQuery()
+            .Where(response =>
+                pendingResponseIds.Contains(response.AiResponseId) &&
+                response.AiStatus != CompletedStatus &&
+                response.AiStatus != CanceledStatus &&
+                response.AiStatus != CancelledStatus)
+            .Select(response => new
+            {
+                response.CaseId,
+                Review = new PendingReviewViewModel(
+                    response.AiResponseId,
+                    response.AiStatus,
+                    response.AiResponseDocuments
+                        .Where(link => link.IsRecordActive && link.Document.IsRecordActive)
+                        .OrderBy(link => link.Document.DocumentName)
+                        .Select(link => new ReviewedDocumentViewModel(
+                            link.AiResponseDocumentId,
+                            link.DocumentId,
+                            $"/api/v1/Cases/documents/{link.DocumentId}/content",
+                            link.Document.DocumentName,
+                            link.Document.FileSize,
+                            link.Document.CodeValue != null
+                                ? link.Document.CodeValue.ShortDescription
+                                : link.Document.SubmittedBy,
+                            link.Document.IsFinancialDocument))
+                        .ToArray())
+            })
+            .ToListAsync(cancellationToken);
+
+        return pendingReviews.ToDictionary(row => row.CaseId, row => row.Review);
     }
 
     public async Task<CaseReviewDetailViewModel?> GetCaseReviewByAiResponseIdAsync(long aiResponseId, CancellationToken cancellationToken = default)
@@ -249,7 +314,7 @@ public class ReviewService : IReviewService
         string? Summary,
         IReadOnlyCollection<ReviewQueueDocumentViewModel> Documents)
     {
-        public ReviewQueueItemViewModel ToViewModel()
+        public ReviewQueueItemViewModel ToViewModel(PendingReviewViewModel? pendingReview)
         {
             return new ReviewQueueItemViewModel(
                 AiResponseId,
@@ -262,7 +327,8 @@ public class ReviewService : IReviewService
                 CreatedDttm,
                 AiStatus,
                 Summary,
-                Documents);
+                Documents,
+                pendingReview);
         }
     }
 

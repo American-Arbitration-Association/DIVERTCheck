@@ -556,10 +556,6 @@ public partial class DivertCheckDbContext : DbContext
 
             entity.HasIndex(e => e.PromptId, "idx_promptconfiguration_promptid");
 
-            entity.HasIndex(e => e.CurrentPrompt, "uq_prompt_configuration_one_current_active")
-                .IsUnique()
-                .HasFilter("((current_prompt = true) AND (is_record_active = true))");
-
             entity.Property(e => e.PromptConfigurationId).HasColumnName("prompt_configuration_id");
             entity.Property(e => e.AiModelIndCode)
                 .HasMaxLength(100)

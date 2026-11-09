@@ -532,9 +532,15 @@ function buildSummary(
 function buildManageDocuments(
   reviewDetail: CaseReviewDetailItem | null,
   fallbackDocuments: ReviewQueueItem["documents"] | undefined,
+  pendingReviewDocuments?: CaseReviewDetailItem["documents"],
 ): ManageDocumentItem[] {
-  if (reviewDetail?.documents.length) {
-    return reviewDetail.documents.map((document, index) => ({
+  // A newer rerun that has not completed owns the case's current documents.
+  const reviewedDocuments = pendingReviewDocuments?.length
+    ? pendingReviewDocuments
+    : reviewDetail?.documents;
+
+  if (reviewedDocuments?.length) {
+    return reviewedDocuments.map((document, index) => ({
       id: String(document.aiResponseDocumentId),
       documentId: document.documentId,
       documentName: document.documentName,
@@ -883,17 +889,32 @@ export default function CaseReview() {
     };
   }, []);
 
+  // Read the pending rerun from the fetched queue, not route state, which survives a browser refresh.
+  const isViewingLatestReview =
+    !searchParams.has("version") ||
+    reviewHistory.find((version) => version.isCurrent)?.reviewVersion ===
+      selectedReviewVersionNumber;
+  const pendingReviewDocuments = isViewingLatestReview
+    ? reviewQueue.find((reviewCase) => reviewCase.caseId === routeCaseId)
+        ?.pendingReview?.documents
+    : undefined;
+
   useEffect(() => {
     const nextManageDocuments = buildManageDocuments(
       displayedReviewDetail,
       cachedReviewCase?.documents,
+      pendingReviewDocuments,
     );
 
     queueMicrotask(() => {
       setCommittedManageDocuments(nextManageDocuments);
       setDraftManageDocuments(nextManageDocuments);
     });
-  }, [displayedReviewDetail, cachedReviewCase?.documents]);
+  }, [
+    displayedReviewDetail,
+    cachedReviewCase?.documents,
+    pendingReviewDocuments,
+  ]);
 
   const documentCount = committedManageDocuments.filter(
     (document) => !document.isDeleted,
@@ -1381,6 +1402,7 @@ export default function CaseReview() {
         scheduledAt: rerunResponse.scheduledAt,
       });
       setActiveRerunJobId(rerunResponse.jobId);
+      void queryClient.invalidateQueries({ queryKey: REVIEW_QUEUE_QUERY_KEY });
       setReviewResultLoadError(null);
       finalizedRerunJobIdRef.current = null;
       setIsCancellationRequested(false);
@@ -1434,6 +1456,7 @@ export default function CaseReview() {
         scheduledAt: rerunResponse.scheduledAt,
       });
       setActiveRerunJobId(rerunResponse.jobId);
+      void queryClient.invalidateQueries({ queryKey: REVIEW_QUEUE_QUERY_KEY });
       setReviewResultLoadError(null);
       finalizedRerunJobIdRef.current = null;
       setIsCancellationRequested(false);

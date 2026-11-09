@@ -817,13 +817,6 @@ CREATE INDEX idx_promptconfiguration_promptid ON your_schema_name.prompt_configu
 
 
 --
--- Name: uq_prompt_configuration_one_current_active; Type: INDEX; Schema: your_schema_name; Owner: -
---
-
-CREATE UNIQUE INDEX uq_prompt_configuration_one_current_active ON your_schema_name.prompt_configuration USING btree (current_prompt) WHERE ((current_prompt = true) AND (is_record_active = true));
-
-
---
 -- Name: ux_ai_response_case_review_version_completed; Type: INDEX; Schema: your_schema_name; Owner: -
 --
 
@@ -845,7 +838,7 @@ CREATE TRIGGER aijobqueue_bu_1 BEFORE UPDATE ON your_schema_name.ai_job_queue FO
 
 
 --
--- Name: ai_response airesponse_bi_1; Type: TRIGGER; Schema: your_schema_name; Owner: -
+-- Name: airesponse_bi_1; Type: TRIGGER; Schema: your_schema_name; Owner: -
 --
 
 CREATE TRIGGER airesponse_bi_1 BEFORE INSERT ON your_schema_name.ai_response FOR EACH ROW EXECUTE FUNCTION your_schema_name.audit_bi_fn();

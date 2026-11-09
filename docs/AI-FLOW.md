@@ -34,7 +34,7 @@ flowchart TB
 
     subgraph s2["2 — Transaction extraction"]
         T1["Only documents flagged<br/>as transaction evidence"]
-        T2["Structured JSON per chunk:<br/>transactions + monetary values"]
+        T2["Structured JSON per statement unit:<br/>summaries + every row + other amounts"]
         T1 --> T2 
     end
 
@@ -90,19 +90,34 @@ This stage only runs for documents the user marked as **transaction evidence** a
 
 The goal is a defensible total of purchase transactions — one that a person can audit line by line.
 
-**The model extracts; it does not calculate.** Each chunk of transaction-evidence text is sent to the model with the active `Transaction` prompt and a structured output schema, and it returns two lists:
+**The model extracts; it does not calculate.** Code in [api/Services/StatementLedger.cs](../api/Services/StatementLedger.cs) decides everything that affects the total.
 
-- **Transactions** — date, description, amount, source page. These are the line items that count toward the total.
-- **Monetary values** — labelled amounts observed on the page (a printed "Total", a balance, a fee) with their source page. These are recorded as *observed*, not summed.
+**Extraction units.** Transaction-evidence text is split into units of whole pages, cut at statement boundaries wherever possible (a page that prints "Page 1 of N", or an Account/Activity Summary on a page that is not "Page 2+ of N"). Units never overlap, so a row can only be extracted by one call. Units are capped at `DocumentProcessing:TransactionChunkMaxCharacters`; a statement longer than that is split at page boundaries, never mid-page. If a response is cut off by the output limit, that unit is re-extracted one page at a time.
 
-Keeping those two lists separate is the point. A printed total on a statement is evidence of what the document claims; it is not a line item, and adding it to the line items would double-count.
+**What the model returns** for each unit (strict structured output, plus a fixed output contract appended to the `Transaction` prompt):
 
-Every returned item is then checked in C# before it is trusted:
+- **Statements**: one per printed Account/Activity Summary, with its page, account identifier, billing period and every summary figure copied as printed (previous balance, payments, credits, purchases, cash advances, balance transfers, other debits, fees, interest, new balance). Issuers that label purchases "Transactions" (Capital One) are handled through `purchases_label`.
+- **Transactions**: every itemized row in every section, including payments, credits, fees, interest and cash advances, each with its page, its position on the page (`row_on_page`), dates, reference number, description, amount as printed and a category (`purchase`, `cash_advance`, `balance_transfer`, `fee`, `interest`, `payment`, `credit`, `other_debit`, `other`). Only `purchase` rows count toward total purchases.
+- **Monetary values**: every other printed amount (section totals, credit line, minimum payment, year-to-date totals, Interest Charge Calculation values). These are listed, never added.
 
-- **Page bounds.** A transaction or monetary value whose `SourcePage` falls outside the chunk's own page range fails the whole run. A citation that cannot be traced back to a real page is worse than no citation.
-- **Amount parsing.** Amounts are stripped of `$` and thousands separators and parsed as `decimal`. A value that will not parse fails the run — it is never coerced to zero or skipped silently.
-- **Deduplication.** Chunks overlap by design (see stage 3), so the same transaction can be extracted twice. Transactions are deduplicated on the tuple *(source document, source page, date, description, amount)*; monetary values on *(source document, source page, label, amount)*.
-- **The sum.** The total is `transactions.Sum(...)` over parsed `decimal` values, computed in C#. The model never adds anything up, so the total cannot drift with sampling and is reproducible from the ledger.
+**Validation.** Each unit's answer is checked before it is used: pages must be inside the unit, each (page, row) must be unique, categories must be known, and amounts must parse strictly. The parser accepts `$1,234.56`, `-$12.00`, `$12.00CR`, `($12.00)` and rejects anything else, including OCR comma-decimals such as `63,00` that a "strip the commas" parser would read as 6300. A failing unit is retried with the specific problems; if it still fails, only the valid items are kept and every rejected item is listed as a warning.
+
+**Duplicates.** Rows are de-duplicated only on *(document, page, row position)*. Two identical purchases on the same day are two rows and are both counted. A second filed copy of the same statement (same account, period and printed figures, in a different statement block) is shown but not counted again; a summary box printed twice inside one statement is treated as one statement.
+
+**Reconciliation.** Each row is attached to its statement, and for every statement the purchase rows are added up and compared with the printed purchases line. The printed summary is also checked with the balance equation (previous − payments − credits + purchases + transfers + advances + other debits + fees + interest = new balance). A statement that does not match is re-extracted once (`DocumentProcessing:LedgerReconciliationRetryCount`) with the exact mismatch; the retry is kept only if more statements reconcile and none stop reconciling.
+
+| Statement status | Purchases used for the total |
+| --- | --- |
+| `Reconciled` | Itemized rows (equal to the printed line) |
+| `Mismatch` | The printed line if the summary balances, otherwise the itemized rows. Flagged |
+| `SummaryOnly` | The printed line (no purchase rows found). Flagged |
+| `NoPrintedPurchases` | Itemized rows. Flagged |
+| `SummaryDoesNotBalance` | Printed line equals itemized rows, but the summary does not balance. Flagged |
+| `DuplicateCopy`, `RepeatedSummary` | Not counted |
+
+Rows in documents with no summary at all (for example a transaction summary list) are counted as itemized rows and flagged as unverifiable. The ledger is `VERIFIED` only when every statement reconciles and there are no warnings; otherwise it is `NEEDS REVIEW` and lists every reason.
+
+**The sum** is computed in C# from parsed `decimal` values. The model never adds anything up.
 
 The result feeds forward three ways: as a synthetic `statement-ledger.txt` document the review can search and cite, as a block appended to the evidence digest, and as a rendered ledger section appended to the final review Markdown.
 
@@ -110,7 +125,7 @@ The result feeds forward three ways: as a synthetic `statement-ledger.txt` docum
 
 [api/Services/DocumentChunkingService.cs](../api/Services/DocumentChunkingService.cs)
 
-All extracted text — every document, not just transaction evidence — is split into chunks of `DocumentProcessing:EvidenceChunkMaxCharacters` with `DocumentProcessing:ChunkOverlap` characters of overlap. The overlap keeps a fact that straddles a boundary from being lost by both neighbours; the cost is the duplication that stage 2 deduplicates.
+All extracted text — every document, not just transaction evidence — is split into chunks of `DocumentProcessing:EvidenceChunkMaxCharacters` with `DocumentProcessing:ChunkOverlap` characters of overlap. The overlap keeps a fact that straddles a boundary from being lost by both neighbours. (Stage 2 does not use these chunks: it builds its own non-overlapping units.)
 
 Chunks are analyzed in parallel, bounded by a semaphore at `DocumentProcessing:MaxParallelEvidenceCalls`, each with its own retry budget (`EvidenceRetryCount`). The per-chunk analyses are folded into an **evidence digest**: a single cross-document map of what was found and where, which the final review uses as its authoritative source rather than re-reading every chunk. If the digest is marked `INCOMPLETE`, the review is instructed to say so rather than present partial findings as complete.
 
@@ -165,6 +180,9 @@ All in `api/appsettings.json`; see [SETUP.md](SETUP.md#configuration-files).
 | `DocumentProcessing:MaxParallelEvidenceCalls` | Concurrent chunk analyses |
 | `DocumentProcessing:EvidenceRetryCount` | Retries per chunk |
 | `DocumentProcessing:EvidenceMaxOutputTokens` | Output budget per chunk analysis |
+| `DocumentProcessing:TransactionChunkMaxCharacters` | Maximum size of a transaction-extraction unit (default 24,000). Whole statements are packed up to this size |
+| `DocumentProcessing:TransactionMaxOutputTokens` | Output budget per transaction-extraction unit (default 32,000). If a response is still cut off, the unit is re-extracted page by page |
+| `DocumentProcessing:LedgerReconciliationRetryCount` | Re-extraction passes for statements that do not reconcile (default 1) |
 | `AiJobProcessing:JobTimeoutSeconds` | Wall-clock limit for one review job |
 | `AiJobProcessing:StaleProcessingTimeoutSeconds` | When a claimed job is considered abandoned and requeued |
 

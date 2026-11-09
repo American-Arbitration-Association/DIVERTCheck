@@ -147,7 +147,11 @@ public sealed class PromptVisionExtractionService : IPromptVisionExtractionServi
             }
         }
 
-        var settings = ResolveSettings(promptConfiguration.AiModelName);
+        // Vision uses the model on its own Vision prompt row; the caller's review model is only a fallback.
+        var settings = ResolveSettings(
+            string.IsNullOrWhiteSpace(visionPrompt.AiModelName)
+                ? promptConfiguration.AiModelName
+                : visionPrompt.AiModelName);
         IReadOnlyList<ExtractedDocumentPage> pages;
         if (IsImageFile(contentType))
         {
@@ -186,10 +190,14 @@ public sealed class PromptVisionExtractionService : IPromptVisionExtractionServi
 
     private async Task<VisionExtractionPrompt> GetVisionExtractionPromptAsync(CancellationToken cancellationToken)
     {
+        // The Vision row marked current_prompt is the one in use. Its id is part of the cache key,
+        // so pointing current_prompt at a different Vision row makes cached extractions miss and
+        // documents go through full vision again under the new row.
         var prompt = await _db.PromptConfigurations
             .AsNoTracking()
             .Where(configuration =>
                 configuration.IsRecordActive &&
+                configuration.CurrentPrompt &&
                 configuration.Prompt.IsRecordActive &&
                 configuration.Prompt.PromptType == VisionPromptType &&
                 configuration.Prompt.MainPromptText != null &&
@@ -199,11 +207,13 @@ public sealed class PromptVisionExtractionService : IPromptVisionExtractionServi
             .Select(configuration => new VisionExtractionPrompt(
                 configuration.PromptConfigurationId,
                 configuration.PromptVersion,
-                configuration.Prompt.MainPromptText!))
+                configuration.Prompt.MainPromptText!,
+                configuration.AiModelName))
             .FirstOrDefaultAsync(cancellationToken);
 
         return prompt is null || string.IsNullOrWhiteSpace(prompt.Text)
-            ? throw new InvalidOperationException("No active vision extraction prompt was configured.")
+            ? throw new InvalidOperationException(
+                "No current vision extraction prompt was configured. Set current_prompt = true on one active Vision prompt_configuration row.")
             : prompt with { Text = prompt.Text.Trim() };
     }
 
@@ -782,7 +792,8 @@ public sealed class PromptVisionExtractionService : IPromptVisionExtractionServi
     private sealed record VisionExtractionPrompt(
         long PromptConfigurationId,
         int PromptVersion,
-        string Text);
+        string Text,
+        string AiModelName);
 
     private sealed class VisionResponseTruncatedException(string message) : InvalidOperationException(message);
 }
